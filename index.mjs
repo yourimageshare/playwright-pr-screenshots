@@ -211,13 +211,14 @@ async function api(pathname, body) {
 const expiresDays = Number(input('expires-in-days', '30')) || 0;
 const visibility = ['private', 'unlisted', 'public'].includes(input('visibility')) ? input('visibility') : 'private';
 
+let TOOL = 'Playwright';   // set in main(): Playwright or Cypress
 async function upload(file, title) {
     const fd = new FormData();
     const buf = fs.readFileSync(file.path);
     const ext = path.extname(file.path).slice(1).toLowerCase().replace('jpg', 'jpeg');
     fd.append('uploads', new Blob([buf], { type: 'image/' + ext }), path.basename(file.path));
     fd.append('visibility', visibility);
-    fd.append('client', 'github-action');
+    fd.append('client', 'github-action-' + TOOL.toLowerCase());   // per-tool upload stats on YourImageShare
     fd.append('title', title.replace(/\s+/g, ' ').slice(0, 90));
     if (expiresDays > 0) fd.append('expires_in', String(Math.min(365, expiresDays) * 86400));
     const d = await api('', fd);
@@ -344,6 +345,7 @@ async function main() {
             if (cy.length || looksLikeCypress()) { failures = cy; framework = 'Cypress'; }
         }
     }
+    TOOL = framework;
     const heading = input('title') || framework;
     setOutput('failed', failures.length);
 
