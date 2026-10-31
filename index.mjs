@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MARK = 'yourimageshare-playwright';
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
+const REPO_LINK = '[⭐ playwright-pr-screenshots](https://github.com/yourimageshare/playwright-pr-screenshots)';
 
 // ---------- GitHub Actions plumbing ----------
 const input = (name, def = '') => {
@@ -299,7 +300,7 @@ const img = (url, alt, w) => `<a href="${url}"><img src="${url}" alt="${alt.repl
 function render({ heading, failures, shown, marker, uploadErrors }) {
     const lines = [`<!-- ${marker} -->`];
     if (!failures.length) {
-        lines.push(`### ✅ ${heading}: all tests passed`, '', `Latest run: [${process.env.GITHUB_WORKFLOW || 'workflow'} #${process.env.GITHUB_RUN_NUMBER || ''}](${runUrl})`);
+        lines.push(`### ✅ ${heading}: all tests passed`, '', `Latest run: [${process.env.GITHUB_WORKFLOW || 'workflow'} #${process.env.GITHUB_RUN_NUMBER || ''}](${runUrl})`, '', `<sub>${REPO_LINK}</sub>`);
         return lines.join('\n');
     }
     const nTests = failures.filter(f => !f.visualOnly).length, nVisual = failures.length - nTests;
@@ -325,7 +326,7 @@ function render({ heading, failures, shown, marker, uploadErrors }) {
     if (failures.length > shown.length) lines.push(`…and ${failures.length - shown.length} more failed test(s). See the [workflow run](${runUrl}).`, '');
     if (uploadErrors) lines.push(`⚠️ ${uploadErrors} screenshot(s) could not be uploaded. See the run log.`, '');
     const keep = expiresDays > 0 ? `deleted after ${expiresDays} day${expiresDays === 1 ? '' : 's'}` : 'kept until you delete them';
-    lines.push('---', `<sub>[Workflow run](${runUrl}) · Screenshots hosted on [YourImageShare](https://yourimageshare.com/?ref=gh-action), ${keep}. Updated on every run.</sub>`);
+    lines.push('---', `<sub>[Workflow run](${runUrl}) · Screenshots hosted on [YourImageShare](https://yourimageshare.com/?ref=gh-action), ${keep}. Updated on every run. · ${REPO_LINK}</sub>`);
     return lines.join('\n');
 }
 
