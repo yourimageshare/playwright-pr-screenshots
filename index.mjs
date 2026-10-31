@@ -1,11 +1,11 @@
-// Playwright failure screenshots in PR comments (YourImageShare). No dependencies: Node 24 has fetch, FormData and Blob.
+// Playwright and Cypress failure screenshots in PR comments (YourImageShare). No dependencies: Node 24 has fetch, FormData and Blob.
 // Finds the screenshots of failed tests, uploads them to YourImageShare, and writes one pull request comment (updated on every
 // run) plus the job summary. It never fails your build: problems are reported as warnings.
 import fs from 'node:fs';
 import path from 'node:path';
 
 const MARK = 'yourimageshare-playwright';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 // ---------- GitHub Actions plumbing ----------
 const input = (name, def = '') => {
@@ -70,6 +70,103 @@ function fromResultsDir(dir) {
         if (!prev || prev.retry < retry) byTest.set(base, { retry, files });
     }
     return [...byTest].map(([base, v]) => ({ title: base, error: '', files: v.files }));
+}
+
+/** A Playwright JSON report has "suites" at the top (a mochawesome report from Cypress has "results"). */
+function isPlaywrightReport(file) {
+    try { const j = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(j.suites); } catch { return false; }
+}
+
+/** Every image under a folder (absolute paths). */
+function walkImages(dir) {
+    const out = [];
+    if (!dir || !fs.existsSync(dir)) return out;
+    const scan = d => { for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, f.name);
+        if (f.isDirectory()) scan(p); else if (isImage(f.name)) out.push(p);
+    } };
+    scan(dir);
+    return out;
+}
+
+const noExt = p => path.basename(p).replace(/\.[^.]+$/, '');
+const looksLikeCypress = () => ['cypress.config.js', 'cypress.config.ts', 'cypress.config.mjs', 'cypress.config.cjs', 'cypress.json']
+    .some(f => fs.existsSync(f)) || fs.existsSync(input('cypress-screenshots', 'cypress/screenshots'));
+
+/** Error messages from a mochawesome report (Cypress), keyed like the screenshot names: "describe -- test". */
+function cypressErrors() {
+    // one file per spec when reporterOptions.overwrite is false (mochawesome.json, mochawesome_001.json, ...)
+    const given = input('json-report');
+    const files = given ? [given] : ['mochawesome-report', 'cypress/results', 'cypress/reports', 'cypress/reports/html/.jsons']
+        .filter(d => fs.existsSync(d) && fs.statSync(d).isDirectory())
+        .flatMap(d => fs.readdirSync(d).filter(f => /^mochawesome.*\.json$/i.test(f)).map(f => path.join(d, f)));
+    const errors = new Map();
+    const walk = (suite, trail) => {
+        const t = suite.title ? [...trail, suite.title] : trail;
+        for (const test of suite.tests || []) {
+            if (test.fail || test.state === 'failed') errors.set([...t, test.title].join(' -- '), stripAnsi((test.err && (test.err.message || test.err.estack)) || ''));
+        }
+        for (const s of suite.suites || []) walk(s, t);
+    };
+    for (const file of files.filter(f => fs.existsSync(f))) {
+        try { for (const r of JSON.parse(fs.readFileSync(file, 'utf8')).results || []) walk(r, []); }
+        catch (e) { warn(`Could not read the mochawesome report ${file}: ${e.message}`); }
+    }
+    if (files.length) console.log(`Read ${files.length} mochawesome report(s): ${errors.size} failed test(s) with messages`);
+    return errors;
+}
+
+/**
+ * Cypress failures: the screenshots Cypress takes when a test fails ("<describe> -- <test> (failed).png", last attempt only),
+ * plus failed visual comparisons of cypress-image-diff-js (baseline / comparison / diff folders) and
+ * cypress-visual-regression (snapshots/base and snapshots/diff; the actual image is a normal Cypress screenshot).
+ */
+function fromCypress() {
+    const shotsDir = input('cypress-screenshots', 'cypress/screenshots');
+    const errors = cypressErrors();
+    const tests = new Map();
+    for (const p of walkImages(shotsDir)) {
+        const m = noExt(p).match(/^(.*) \(failed\)(?: \(attempt (\d+)\))?$/);
+        if (!m) continue;
+        const spec = path.relative(shotsDir, path.dirname(p)).split(path.sep).join('/');
+        const k = spec + '|' + m[1], attempt = Number(m[2] || 1);
+        const prev = tests.get(k);
+        if (prev && prev.attempt >= attempt) continue;
+        tests.set(k, { attempt, title: [spec, ...m[1].split(' -- ')].filter(Boolean).join(' › '), error: errors.get(m[1]) || '',
+            files: [{ name: 'screenshot', path: p }] });
+    }
+    const out = [...tests.values()].map(({ attempt, ...t }) => t);
+    console.log(`Scanned ${shotsDir}: ${out.length} failed test(s) with screenshots`);
+
+    // cypress-image-diff-js: a diff image is only written when the comparison fails
+    const idj = input('image-diff-dir', 'cypress-image-diff-screenshots');
+    for (const d of walkImages(path.join(idj, 'diff'))) {
+        const rel = path.relative(path.join(idj, 'diff'), d), name = noExt(rel);
+        const files = [{ name: name + '-expected', path: path.join(idj, 'baseline', rel) }, { name: name + '-actual', path: path.join(idj, 'comparison', rel) },
+            { name: name + '-diff', path: d }].filter(f => fs.existsSync(f.path));
+        out.push({ title: 'Visual difference › ' + rel.split(path.sep).join('/').replace(/\.[^.]+$/, ''), error: '', files });
+    }
+
+    // cypress-visual-regression: diff/<spec>/<name>[ (attempt N)].png next to base/<spec>/<name>.png
+    const vr = input('snapshots-dir', 'cypress/snapshots');
+    const shots = walkImages(shotsDir);
+    const lastAttempt = new Map();   // with retries there is one diff per attempt: keep the last
+    for (const d of walkImages(path.join(vr, 'diff'))) {
+        const rel = path.relative(path.join(vr, 'diff'), d), m = noExt(rel).match(/^(.*?)(?: \(attempt (\d+)\))?$/);
+        const k = path.dirname(rel) + '|' + m[1], n = Number(m[2] || 1);
+        if (!lastAttempt.has(k) || lastAttempt.get(k).n < n) lastAttempt.set(k, { n, d });
+    }
+    for (const { d } of lastAttempt.values()) {
+        const rel = path.relative(path.join(vr, 'diff'), d), dir = path.dirname(rel), full = noExt(rel);
+        const name = full.replace(/ \(attempt \d+\)$/, '');
+        const specName = path.basename(dir);
+        const actual = shots.find(s => path.basename(path.dirname(s)) === specName && noExt(s) === full)
+            || shots.find(s => path.basename(path.dirname(s)) === specName && noExt(s) === name);
+        const files = [{ name: name + '-expected', path: path.join(vr, 'base', dir, name + '.png') }, actual && { name: name + '-actual', path: actual },
+            { name: name + '-diff', path: d }].filter(f => f && fs.existsSync(f.path));
+        out.push({ title: `Visual difference › ${specName} › ${name}`, error: '', files });
+    }
+    return out;
 }
 
 /** Split a test's images into visual-diff groups (expected/actual/diff) and plain screenshots. */
@@ -213,22 +310,41 @@ function render({ heading, failures, shown, marker, uploadErrors }) {
 }
 
 // ---------- main ----------
-async function main() {
-    const heading = input('title', 'Playwright');
-    const key = input('comment-key') || process.env.GITHUB_JOB || 'default';
-    const marker = `${MARK}:${key}`;
-
+function collectPlaywright() {
     let failures = [];
     const candidates = [input('json-report'), 'playwright-report/results.json', 'test-results.json', 'results.json'].filter(Boolean);
-    const report = candidates.find(p => fs.existsSync(p));
+    const report = candidates.find(p => fs.existsSync(p) && isPlaywrightReport(p));
     if (report) {
         try { failures = fromJsonReport(report); console.log(`Read ${report}: ${failures.length} failed test(s)`); }
         catch (e) { warn(`Could not read the JSON report ${report}: ${e.message}`); }
     }
     if (!report || (!failures.length && input('json-report') === '')) {
-        const dirFailures = fromResultsDir(input('results-dir', 'test-results'));
-        if (!report || dirFailures.length) { failures = dirFailures; console.log(`Scanned ${input('results-dir', 'test-results')}: ${failures.length} test folder(s) with screenshots`); }
+        const dir = input('results-dir', 'test-results');
+        const dirFailures = fromResultsDir(dir);
+        if (!report || dirFailures.length) { failures = dirFailures; console.log(`Scanned ${dir}: ${failures.length} test folder(s) with screenshots`); }
     }
+    return failures;
+}
+
+async function main() {
+    const key = input('comment-key') || process.env.GITHUB_JOB || 'default';
+    const marker = `${MARK}:${key}`;
+
+    // which test tool: "auto" looks for Playwright results first, then Cypress
+    const fw = input('framework', 'auto').toLowerCase();
+    let failures = [], framework = 'Playwright';
+    if (fw === 'cypress') {
+        failures = fromCypress(); framework = 'Cypress';
+    } else if (fw === 'playwright') {
+        failures = collectPlaywright();
+    } else {
+        failures = collectPlaywright();
+        if (!failures.length) {
+            const cy = fromCypress();
+            if (cy.length || looksLikeCypress()) { failures = cy; framework = 'Cypress'; }
+        }
+    }
+    const heading = input('title') || framework;
     setOutput('failed', failures.length);
 
     const doComment = bool('comment', true);

@@ -1,5 +1,5 @@
-name: Playwright failure screenshots in PR comments
-description: Posts Playwright failure screenshots and visual diffs as images in a pull request comment, hosted free on YourImageShare.
+name: Playwright and Cypress failure screenshots in PR comments
+description: Posts Playwright or Cypress failure screenshots and visual diffs as images in a pull request comment, hosted free on YourImageShare.
 author: YourImageShare
 branding:
   icon: image
@@ -9,12 +9,24 @@ inputs:
   api-key:
     description: YourImageShare API key. Use the upload-only key from your account settings, stored as a repository secret.
     required: true
+  framework:
+    description: auto, playwright or cypress. auto uses Playwright results when there are any, otherwise Cypress.
+    default: auto
   results-dir:
     description: Playwright's output folder (outputDir in playwright.config). Used when no JSON report is found.
     default: test-results
   json-report:
-    description: Path to a Playwright JSON report (reporter "json" with an outputFile). Gives exact test names and error messages. Optional.
+    description: Optional. Playwright JSON report (reporter "json" with an outputFile), or for Cypress a mochawesome JSON report. Adds error messages.
     default: ''
+  cypress-screenshots:
+    description: Cypress screenshotsFolder.
+    default: cypress/screenshots
+  image-diff-dir:
+    description: Folder of the cypress-image-diff-js plugin (baseline, comparison and diff inside).
+    default: cypress-image-diff-screenshots
+  snapshots-dir:
+    description: Folder of the cypress-visual-regression plugin (base and diff inside).
+    default: cypress/snapshots
   github-token:
     description: Token used to write the comment. Needs "pull-requests write" permission.
     default: ${{ github.token }}
@@ -28,7 +40,7 @@ inputs:
     description: private (the image files only; no public pages), unlisted, or public.
     default: private
   slider:
-    description: For visual comparison failures (toHaveScreenshot), also make a before/after slider of expected vs actual.
+    description: For visual comparison failures, also make a before/after slider of expected vs actual.
     default: 'true'
   comment:
     description: Post or update a pull request comment. When false, only the job summary is written.
@@ -37,8 +49,8 @@ inputs:
     description: Keeps one comment per key. Set a different key per matrix job (for example the browser name) to get one comment each.
     default: ''
   title:
-    description: Heading of the comment.
-    default: Playwright
+    description: Heading of the comment. Default is the tool's name (Playwright or Cypress).
+    default: ''
   api-url:
     description: YourImageShare API base URL.
     default: https://yourimageshare.com/api
