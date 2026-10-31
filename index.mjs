@@ -140,11 +140,12 @@ function fromCypress() {
 
     // cypress-image-diff-js: a diff image is only written when the comparison fails
     const idj = input('image-diff-dir', 'cypress-image-diff-screenshots');
+    const visuals = [];
     for (const d of walkImages(path.join(idj, 'diff'))) {
         const rel = path.relative(path.join(idj, 'diff'), d), name = noExt(rel);
         const files = [{ name: name + '-expected', path: path.join(idj, 'baseline', rel) }, { name: name + '-actual', path: path.join(idj, 'comparison', rel) },
             { name: name + '-diff', path: d }].filter(f => fs.existsSync(f.path));
-        out.push({ title: 'Visual difference › ' + rel.split(path.sep).join('/').replace(/\.[^.]+$/, ''), error: '', files });
+        visuals.push({ name: path.basename(name), spec: '', title: 'Visual difference › ' + rel.split(path.sep).join('/').replace(/\.[^.]+$/, ''), files });
     }
 
     // cypress-visual-regression: diff/<spec>/<name>[ (attempt N)].png next to base/<spec>/<name>.png
@@ -164,9 +165,25 @@ function fromCypress() {
             || shots.find(s => path.basename(path.dirname(s)) === specName && noExt(s) === name);
         const files = [{ name: name + '-expected', path: path.join(vr, 'base', dir, name + '.png') }, actual && { name: name + '-actual', path: actual },
             { name: name + '-diff', path: d }].filter(f => f && fs.existsSync(f.path));
-        out.push({ title: `Visual difference › ${specName} › ${name}`, error: '', files });
+        visuals.push({ name: path.basename(name), spec: specName, title: `Visual difference › ${specName} › ${name}`, files });
     }
+    for (const v of visuals) attachVisual(out, v);
     return out;
+}
+
+/**
+ * Put a plugin's visual diff under the failed test it belongs to: same spec, the snapshot name in the error, or an
+ * "image difference" style error. Ambiguous ones stay a block of their own and are counted as visual differences.
+ */
+function attachVisual(tests, v) {
+    const isVisualError = t => /image (difference|is different)|threshold|snapshot|screenshot.*differ/i.test(t.error || '');
+    const specOf = t => t.title.split(' › ')[0];
+    const pick = list => list.length === 1 ? list[0] : null;
+    const same = v.spec ? tests.filter(t => specOf(t) === v.spec) : tests.filter(t => v.name.startsWith(specOf(t).replace(/\.(cy|spec)\.[jt]sx?$/, '') + '-'));
+    const pool = same.length ? same : tests;
+    const target = pick(pool.filter(t => (t.error || '').includes(v.name))) || pick(pool.filter(isVisualError)) || (v.spec ? pick(same) : null);
+    if (target) target.files.push(...v.files);
+    else tests.push({ title: v.title, error: '', files: v.files, visualOnly: true });
 }
 
 /** Split a test's images into visual-diff groups (expected/actual/diff) and plain screenshots. */
@@ -285,7 +302,9 @@ function render({ heading, failures, shown, marker, uploadErrors }) {
         lines.push(`### ✅ ${heading}: all tests passed`, '', `Latest run: [${process.env.GITHUB_WORKFLOW || 'workflow'} #${process.env.GITHUB_RUN_NUMBER || ''}](${runUrl})`);
         return lines.join('\n');
     }
-    lines.push(`### ❌ ${heading}: ${failures.length} failed test${failures.length === 1 ? '' : 's'}`, '');
+    const nTests = failures.filter(f => !f.visualOnly).length, nVisual = failures.length - nTests;
+    const counts = [nTests && `${nTests} failed test${nTests === 1 ? '' : 's'}`, nVisual && `${nVisual} visual difference${nVisual === 1 ? '' : 's'}`].filter(Boolean);
+    lines.push(`### ❌ ${heading}: ${counts.join(', ')}`, '');
     for (const f of shown) {
         lines.push(`<details open><summary><b>${f.title.replace(/</g, '&lt;')}</b></summary>`, '');
         if (f.error) lines.push(fence(firstLines(f.error)), '');
