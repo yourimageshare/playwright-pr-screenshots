@@ -1,0 +1,281 @@
+// Playwright failure screenshots in PR comments (YourImageShare). No dependencies: Node 24 has fetch, FormData and Blob.
+// Finds the screenshots of failed tests, uploads them to YourImageShare, and writes one pull request comment (updated on every
+// run) plus the job summary. It never fails your build: problems are reported as warnings.
+import fs from 'node:fs';
+import path from 'node:path';
+
+const MARK = 'yourimageshare-playwright';
+const VERSION = '1.0.0';
+
+// ---------- GitHub Actions plumbing ----------
+const input = (name, def = '') => {
+    const v = process.env['INPUT_' + name.toUpperCase()];
+    return v === undefined || v === '' ? def : v.trim();
+};
+const bool = (name, def) => !/^(false|0|no|off)$/i.test(input(name, String(def)));
+const esc = s => String(s).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+const warn = msg => console.log(`::warning title=YourImageShare::${esc(msg)}`);
+const notice = msg => console.log(`::notice title=YourImageShare::${esc(msg)}`);
+function setOutput(name, value) {
+    if (!process.env.GITHUB_OUTPUT) return;
+    const d = 'EOF_' + Math.random().toString(36).slice(2);
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `${name}<<${d}\n${value}\n${d}\n`);
+}
+
+// ---------- finding failures ----------
+const stripAnsi = s => String(s || '').replace(/\u001b\[[0-9;]*[A-Za-z]/g, '');
+const isImage = p => /\.(png|jpe?g|webp)$/i.test(p || '');
+
+/** Failures from a Playwright JSON report: [{title, error, files: [{name, path}]}] */
+function fromJsonReport(file, root) {
+    const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const out = [];
+    const walk = (suite, trail) => {
+        const t = suite.title && !/\.(spec|test)\.[cm]?[jt]sx?$/.test(suite.title) ? [...trail, suite.title] : trail;
+        for (const spec of suite.specs || []) {
+            for (const test of spec.tests || []) {
+                if (test.status !== 'unexpected') continue;          // flaky tests passed on a retry
+                const r = (test.results || [])[test.results.length - 1] || {};
+                const err = (r.errors && r.errors[0] && r.errors[0].message) || (r.error && r.error.message) || '';
+                const files = (r.attachments || []).filter(a => a.path && isImage(a.path) && fs.existsSync(a.path))
+                    .map(a => ({ name: a.name, path: a.path }));
+                const fileName = spec.file || suite.file || '';
+                const title = [fileName, ...t, spec.title].filter(Boolean).join(' › ') + (test.projectName ? ` (${test.projectName})` : '');
+                out.push({ title, error: stripAnsi(err), files });
+            }
+        }
+        for (const s of suite.suites || []) walk(s, t);
+    };
+    for (const s of report.suites || []) walk(s, []);
+    return out;
+}
+
+/** Failures from the output folder: one folder per failed test, the last retry only. */
+function fromResultsDir(dir) {
+    if (!fs.existsSync(dir)) return [];
+    const byTest = new Map();
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!ent.isDirectory()) continue;
+        const m = ent.name.match(/^(.*?)(?:-retry(\d+))?$/);
+        const base = m[1], retry = Number(m[2] || 0);
+        const full = path.join(dir, ent.name);
+        const files = [];
+        const scan = d => { for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+            const p = path.join(d, f.name);
+            if (f.isDirectory()) scan(p); else if (isImage(f.name)) files.push({ name: f.name.replace(/\.[^.]+$/, ''), path: p });
+        } };
+        scan(full);
+        if (!files.length) continue;
+        const prev = byTest.get(base);
+        if (!prev || prev.retry < retry) byTest.set(base, { retry, files });
+    }
+    return [...byTest].map(([base, v]) => ({ title: base, error: '', files: v.files }));
+}
+
+/** Split a test's images into visual-diff groups (expected/actual/diff) and plain screenshots. */
+function groupFiles(files) {
+    const diffs = new Map(), shots = [];
+    for (const f of files) {
+        const m = path.basename(f.path).match(/^(.*)-(expected|actual|diff)\.[a-z]+$/i);
+        if (m) {
+            if (!diffs.has(m[1])) diffs.set(m[1], {});
+            diffs.get(m[1])[m[2].toLowerCase()] = f;
+        } else {
+            shots.push(f);
+        }
+    }
+    return { diffs: [...diffs].map(([name, g]) => ({ name, ...g })), shots };
+}
+
+// ---------- YourImageShare API ----------
+const API = input('api-url', 'https://yourimageshare.com/api').replace(/\/+$/, '');
+const KEY = input('api-key');
+const UA = `yourimageshare-playwright-action/${VERSION}`;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function api(pathname, body) {
+    for (let attempt = 0; ; attempt++) {
+        const res = await fetch(API + pathname, { method: 'POST', body, headers: { 'X-API-Key': KEY, 'User-Agent': UA, Accept: 'application/json' } });
+        if (res.status === 429 && attempt < 3) {   // 20 uploads a minute per key: wait as told, then try again
+            const wait = Math.min(65, Number(res.headers.get('retry-after')) || 20);
+            console.log(`Rate limited, waiting ${wait}s`);
+            await sleep(wait * 1000);
+            continue;
+        }
+        if (res.status >= 500 && attempt < 2) { await sleep(3000); continue; }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(`${res.status} ${typeof data.errors === 'string' ? data.errors : JSON.stringify(data.errors || data)}`);
+        return data;
+    }
+}
+
+const expiresDays = Number(input('expires-in-days', '30')) || 0;
+const visibility = ['private', 'unlisted', 'public'].includes(input('visibility')) ? input('visibility') : 'private';
+
+async function upload(file, title) {
+    const fd = new FormData();
+    const buf = fs.readFileSync(file.path);
+    const ext = path.extname(file.path).slice(1).toLowerCase().replace('jpg', 'jpeg');
+    fd.append('uploads', new Blob([buf], { type: 'image/' + ext }), path.basename(file.path));
+    fd.append('visibility', visibility);
+    fd.append('client', 'github-action');
+    fd.append('title', title.replace(/\s+/g, ' ').slice(0, 90));
+    if (expiresDays > 0) fd.append('expires_in', String(Math.min(365, expiresDays) * 86400));
+    const d = await api('', fd);
+    const item = d.data || d;   // POST /api answers {type, data: {...}} (or the item itself for older shapes)
+    return { id: item.id, url: item.src || item.path };
+}
+
+async function compare(beforeId, afterId, title) {
+    const fd = new FormData();
+    fd.append('before', beforeId); fd.append('after', afterId);
+    fd.append('title', title.slice(0, 120));
+    fd.append('label_before', 'Expected'); fd.append('label_after', 'Actual');
+    return api('/compare', fd);
+}
+
+// ---------- GitHub API ----------
+const GH = process.env.GITHUB_API_URL || 'https://api.github.com';
+const REPO = process.env.GITHUB_REPOSITORY || '';
+const TOKEN = input('github-token');
+async function gh(method, url, body) {
+    const res = await fetch(url.startsWith('http') ? url : GH + url, {
+        method, body: body ? JSON.stringify(body) : undefined,
+        headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': UA },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`GitHub ${method} ${url}: ${res.status} ${data.message || ''}`);
+    return data;
+}
+
+async function prNumber() {
+    let ev = {};
+    try { ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')); } catch {}
+    if (ev.pull_request && ev.pull_request.number) return ev.pull_request.number;
+    if (ev.issue && ev.issue.pull_request) return ev.issue.number;
+    // a push or a manual run: the open pull request that has this commit, if any
+    const sha = process.env.GITHUB_SHA;
+    if (!sha || !TOKEN || !REPO) return null;
+    try {
+        const prs = await gh('GET', `/repos/${REPO}/commits/${sha}/pulls`);
+        const open = prs.find(p => p.state === 'open');
+        return open ? open.number : null;
+    } catch { return null; }
+}
+
+async function findComment(pr, marker) {
+    for (let page = 1; page <= 10; page++) {
+        const list = await gh('GET', `/repos/${REPO}/issues/${pr}/comments?per_page=100&page=${page}`);
+        const hit = list.find(c => (c.body || '').includes(marker));
+        if (hit) return hit;
+        if (list.length < 100) return null;
+    }
+    return null;
+}
+
+// ---------- comment ----------
+const runUrl = `${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${REPO}/actions/runs/${process.env.GITHUB_RUN_ID || ''}`;
+const fence = s => '```\n' + s.replace(/```/g, '`​``') + '\n```';
+const firstLines = (s, n = 6, max = 600) => { const t = s.split('\n').filter(l => l.trim()).slice(0, n).join('\n'); return t.length > max ? t.slice(0, max) + '…' : t; };
+const img = (url, alt, w) => `<a href="${url}"><img src="${url}" alt="${alt.replace(/"/g, '&quot;')}" width="${w}"></a>`;
+
+function render({ heading, failures, shown, marker, uploadErrors }) {
+    const lines = [`<!-- ${marker} -->`];
+    if (!failures.length) {
+        lines.push(`### ✅ ${heading}: all tests passed`, '', `Latest run: [${process.env.GITHUB_WORKFLOW || 'workflow'} #${process.env.GITHUB_RUN_NUMBER || ''}](${runUrl})`);
+        return lines.join('\n');
+    }
+    lines.push(`### ❌ ${heading}: ${failures.length} failed test${failures.length === 1 ? '' : 's'}`, '');
+    for (const f of shown) {
+        lines.push(`<details open><summary><b>${f.title.replace(/</g, '&lt;')}</b></summary>`, '');
+        if (f.error) lines.push(fence(firstLines(f.error)), '');
+        for (const d of f.diffs) {
+            const cells = ['expected', 'actual', 'diff'].filter(k => d[k] && d[k].url);
+            if (cells.length) {
+                lines.push(`| ${cells.map(k => k[0].toUpperCase() + k.slice(1)).join(' | ')} |`, `| ${cells.map(() => '---').join(' | ')} |`,
+                    `| ${cells.map(k => img(d[k].url, `${d.name} ${k}`, 260)).join(' | ')} |`, '');
+            }
+            if (d.slider) lines.push(`🔀 [Compare expected and actual with a slider](${d.slider})`, '');
+        }
+        for (const s of f.shots.filter(s => s.url)) lines.push(img(s.url, s.name, 600), '');
+        if (!f.diffs.length && !f.shots.some(s => s.url)) lines.push('_No screenshot was saved for this test._', '');
+        lines.push('</details>', '');
+    }
+    if (failures.length > shown.length) lines.push(`…and ${failures.length - shown.length} more failed test(s). See the [workflow run](${runUrl}).`, '');
+    if (uploadErrors) lines.push(`⚠️ ${uploadErrors} screenshot(s) could not be uploaded. See the run log.`, '');
+    const keep = expiresDays > 0 ? `deleted after ${expiresDays} day${expiresDays === 1 ? '' : 's'}` : 'kept until you delete them';
+    lines.push('---', `<sub>[Workflow run](${runUrl}) · Screenshots hosted on [YourImageShare](https://yourimageshare.com/?ref=gh-action), ${keep}. Updated on every run.</sub>`);
+    return lines.join('\n');
+}
+
+// ---------- main ----------
+async function main() {
+    const heading = input('title', 'Playwright');
+    const key = input('comment-key') || process.env.GITHUB_JOB || 'default';
+    const marker = `${MARK}:${key}`;
+
+    let failures = [];
+    const candidates = [input('json-report'), 'playwright-report/results.json', 'test-results.json', 'results.json'].filter(Boolean);
+    const report = candidates.find(p => fs.existsSync(p));
+    if (report) {
+        try { failures = fromJsonReport(report); console.log(`Read ${report}: ${failures.length} failed test(s)`); }
+        catch (e) { warn(`Could not read the JSON report ${report}: ${e.message}`); }
+    }
+    if (!report || (!failures.length && input('json-report') === '')) {
+        const dirFailures = fromResultsDir(input('results-dir', 'test-results'));
+        if (!report || dirFailures.length) { failures = dirFailures; console.log(`Scanned ${input('results-dir', 'test-results')}: ${failures.length} test folder(s) with screenshots`); }
+    }
+    setOutput('failed', failures.length);
+
+    const doComment = bool('comment', true);
+    const pr = doComment && TOKEN ? await prNumber() : null;
+    let existing = null;
+    if (pr) { try { existing = await findComment(pr, marker); } catch (e) { warn(e.message); } }
+
+    if (!failures.length && !existing) { console.log('No failures and no earlier comment: nothing to do.'); return; }
+    if (failures.length && !KEY) {
+        warn('No api-key: screenshots were not uploaded. Pull requests from forks get no secrets; for your own branches add the YOURIMAGESHARE_API_KEY secret.');
+        return;
+    }
+
+    const max = Math.max(1, Number(input('max-tests', '20')) || 20);
+    const shown = failures.slice(0, max).map(f => ({ ...f, ...groupFiles(f.files) }));
+    const uploaded = [];
+    let uploadErrors = 0;
+    for (const f of shown) {
+        const items = [...f.diffs.flatMap(d => ['expected', 'actual', 'diff'].filter(k => d[k]).map(k => d[k])), ...f.shots];
+        for (const file of items) {
+            try {
+                const r = await upload(file, `${f.title} - ${file.name}`);
+                Object.assign(file, r);
+                uploaded.push({ test: f.title, name: file.name, url: r.url });
+            } catch (e) { uploadErrors++; warn(`Upload failed for ${file.path}: ${e.message}`); }
+        }
+        if (bool('slider', true)) {
+            for (const d of f.diffs) {
+                if (!d.expected?.id || !d.actual?.id) continue;
+                try { d.slider = (await compare(d.expected.id, d.actual.id, `${f.title} - ${d.name}`)).url; }
+                catch (e) { warn(`Could not make the slider for ${d.name}: ${e.message}`); }
+            }
+        }
+    }
+    setOutput('screenshots', JSON.stringify(uploaded));
+    console.log(`Uploaded ${uploaded.length} screenshot(s)`);
+
+    const body = render({ heading, failures, shown, marker, uploadErrors });
+    if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, body + '\n');
+
+    if (!doComment) return;
+    if (!pr) { notice('No pull request for this run: results are in the job summary.'); return; }
+    try {
+        const c = existing
+            ? await gh('PATCH', `/repos/${REPO}/issues/comments/${existing.id}`, { body })
+            : await gh('POST', `/repos/${REPO}/issues/${pr}/comments`, { body });
+        setOutput('comment-url', c.html_url);
+        console.log(`Comment: ${c.html_url}`);
+    } catch (e) {
+        warn(`Could not write the pull request comment (${e.message}). Give the job "permissions: pull-requests: write". Results are in the job summary.`);
+    }
+}
+
+main().catch(e => warn(`Unexpected error: ${e.stack || e.message}`));

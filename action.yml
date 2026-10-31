@@ -1,0 +1,56 @@
+name: Playwright failure screenshots in PR comments
+description: Posts Playwright failure screenshots and visual diffs as images in a pull request comment, hosted free on YourImageShare.
+author: YourImageShare
+branding:
+  icon: image
+  color: blue
+
+inputs:
+  api-key:
+    description: YourImageShare API key. Use the upload-only key from your account settings, stored as a repository secret.
+    required: true
+  results-dir:
+    description: Playwright's output folder (outputDir in playwright.config). Used when no JSON report is found.
+    default: test-results
+  json-report:
+    description: Path to a Playwright JSON report (reporter "json" with an outputFile). Gives exact test names and error messages. Optional.
+    default: ''
+  github-token:
+    description: Token used to write the comment. Needs "pull-requests write" permission.
+    default: ${{ github.token }}
+  max-tests:
+    description: Most failed tests to show screenshots for. The rest are counted.
+    default: '20'
+  expires-in-days:
+    description: Delete the uploaded screenshots after this many days. 0 keeps them.
+    default: '30'
+  visibility:
+    description: private (the image files only; no public pages), unlisted, or public.
+    default: private
+  slider:
+    description: For visual comparison failures (toHaveScreenshot), also make a before/after slider of expected vs actual.
+    default: 'true'
+  comment:
+    description: Post or update a pull request comment. When false, only the job summary is written.
+    default: 'true'
+  comment-key:
+    description: Keeps one comment per key. Set a different key per matrix job (for example the browser name) to get one comment each.
+    default: ''
+  title:
+    description: Heading of the comment.
+    default: Playwright
+  api-url:
+    description: YourImageShare API base URL.
+    default: https://yourimageshare.com/api
+
+outputs:
+  failed:
+    description: Number of failed tests found.
+  comment-url:
+    description: Link to the pull request comment, when one was written.
+  screenshots:
+    description: JSON list of uploaded screenshots ({test, name, url}).
+
+runs:
+  using: node24
+  main: index.mjs
