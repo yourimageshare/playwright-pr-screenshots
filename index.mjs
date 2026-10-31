@@ -76,7 +76,9 @@ function fromResultsDir(dir) {
 function groupFiles(files) {
     const diffs = new Map(), shots = [];
     for (const f of files) {
-        const m = path.basename(f.path).match(/^(.*)-(expected|actual|diff)\.[a-z]+$/i);
+        // the attachment name says the role (the expected file itself is the baseline, e.g. hero-chromium-linux.png)
+        const m = String(f.name || '').match(/^(.*)-(expected|actual|diff)(?:\.[a-z]+)?$/i)
+            || path.basename(f.path).match(/^(.*)-(expected|actual|diff)\.[a-z]+$/i);
         if (m) {
             if (!diffs.has(m[1])) diffs.set(m[1], {});
             diffs.get(m[1])[m[2].toLowerCase()] = f;
@@ -197,7 +199,9 @@ function render({ heading, failures, shown, marker, uploadErrors }) {
             }
             if (d.slider) lines.push(`🔀 [Compare expected and actual with a slider](${d.slider})`, '');
         }
-        for (const s of f.shots.filter(s => s.url)) lines.push(img(s.url, s.name, 600), '');
+        const shots = f.shots.filter(s => s.url).map(s => img(s.url, s.name, 600));
+        if (shots.length && f.diffs.length) lines.push('<details><summary>Full page</summary>', '', ...shots, '', '</details>', '');   // the table says it all
+        else for (const s of shots) lines.push(s, '');
         if (!f.diffs.length && !f.shots.some(s => s.url)) lines.push('_No screenshot was saved for this test._', '');
         lines.push('</details>', '');
     }
