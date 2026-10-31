@@ -4,7 +4,7 @@ See **why** a Playwright or Cypress test failed without leaving the pull request
 screenshots and visual diffs to [YourImageShare](https://yourimageshare.com) (free) and posts them as images in one pull
 request comment. No more downloading artifact zips to find the right PNG.
 
-<p align="center"><img src="docs/pr-comment.png" alt="Pull request comment with a failed Playwright test: error message, screenshot, and an Expected | Actual | Diff table with a slider link" width="760"></p>
+<p align="center"><a href="https://yourimageshare.com/ib/s0lObQ0vny"><img src="https://yourimageshare.com/ib/s0lObQ0vny.png" alt="Pull request comment with a failed Playwright test: error message, screenshot, and an Expected | Actual | Diff table with a slider link" width="760"></a></p>
 
 - Failure screenshots shown inline, with the error message
 - Visual comparison failures as an **Expected | Actual | Diff** table, plus a link to a **before/after slider** of

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MARK = 'yourimageshare-playwright';
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 const REPO_LINK = '[⭐ playwright-pr-screenshots](https://github.com/yourimageshare/playwright-pr-screenshots)';
 
 // ---------- GitHub Actions plumbing ----------
